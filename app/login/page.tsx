@@ -15,7 +15,10 @@ export default function LoginPage() {
     setLoading(true)
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
-      options: { redirectTo: `${location.origin}/dashboard` },
+      options: {
+        redirectTo: `${location.origin}/dashboard`,
+        scopes: 'https://www.googleapis.com/auth/drive.readonly',
+      },
     })
     if (error) { setError(error.message); setLoading(false) }
   }
