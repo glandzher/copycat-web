@@ -69,7 +69,7 @@ function VideoViewer() {
             <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
               <span className="text-base leading-none mt-0.5">⏳</span>
               <p className="leading-relaxed">
-                Drive needs ~5&nbsp;min to make new files publicly streamable. Share link works after that. Need it now? Ask the sender to download and send the file directly.
+                Drive needs ~5&nbsp;min to make new files publicly streamable. Share link works after that. Need it now? Click the &ldquo;Open in Google Drive&rdquo; button and then click download.
               </p>
             </div>
 
