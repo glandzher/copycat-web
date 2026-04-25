@@ -208,9 +208,12 @@ function EditorInner() {
       const audio = await decodeTo16kMono(videoBlob)
       setProgress({ pct: 15, msg: 'Loading speech model (cached after first run)…' })
 
-      const tr = await import(/* webpackIgnore: true */
+      // Dynamic URL import via `new Function` so TypeScript & webpack don't try
+      // to statically resolve the remote module at build time.
+      const dynamicImport = new Function('u', 'return import(u)') as (u: string) => Promise<any>
+      const tr = await dynamicImport(
         'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2/dist/transformers.min.mjs'
-      ) as any
+      )
       tr.env.allowLocalModels = false
       tr.env.useBrowserCache  = true
       tr.env.backends.onnx.wasm.numThreads = 1
