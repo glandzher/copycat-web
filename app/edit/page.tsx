@@ -213,6 +213,16 @@ function EditorInner() {
   const whisperRef = useRef<{ model: string, pipe: any } | null>(null)
   const audioRef   = useRef<Float32Array | null>(null)
   const [retranscribingIdx, setRetranscribingIdx] = useState<number | null>(null)
+  const [retranscribedFlash, setRetranscribedFlash] = useState<number | null>(null)
+
+  // Warn before closing during transcription / re-run / save
+  useEffect(() => {
+    const busy = stage === 'transcribing' || retranscribingIdx !== null || saving
+    if (!busy) return
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [stage, retranscribingIdx, saving])
 
   // 1. Auth + Drive download + sidecar load
   useEffect(() => {
@@ -349,13 +359,37 @@ function EditorInner() {
     try {
       const audio = await decodeTo16kMono(videoBlob)
       audioRef.current = audio
+      const audioDur = audio.length / 16000
       const pipe = await ensureWhisper(model, (pct, msg) => setProgress({ pct, msg }))
-      setProgress({ pct: 70, msg: 'Transcribing…' })
-      const chunks = await runWhisper(pipe, audio)
-      setTranscript(chunks)
-      setSteps(chunksToSteps(chunks))
-      setStage('editor')
-      setProgress({ pct: 100, msg: 'Done' })
+
+      // While Whisper runs we have no granular progress hook, so we run a
+      // wall-clock ticker. Whisper-base ≈ 0.5× realtime on a modern laptop
+      // (i.e. 1 min of audio = ~30s of compute); medium/large can be 5–10×.
+      // We use that ratio per model to estimate %.
+      const ratio: Record<string, number> = {
+        'Xenova/whisper-base':           0.5,
+        'Xenova/whisper-small':          1.5,
+        'Xenova/whisper-medium':         5,
+        'distil-whisper/distil-large-v3': 3,
+      }
+      const expectedSec = audioDur * (ratio[model] || 2)
+      const startedAt   = Date.now()
+      let tick: any = setInterval(() => {
+        const elapsed = (Date.now() - startedAt) / 1000
+        const pct     = Math.min(95, 70 + (elapsed / expectedSec) * 25)
+        setProgress({
+          pct,
+          msg: `Transcribing ${audioDur.toFixed(0)} s of audio · ${elapsed.toFixed(0)} s elapsed (est. ~${Math.max(0, expectedSec - elapsed).toFixed(0)} s left)`,
+        })
+      }, 1000)
+
+      try {
+        const chunks = await runWhisper(pipe, audio)
+        setTranscript(chunks)
+        setSteps(chunksToSteps(chunks))
+        setStage('editor')
+        setProgress({ pct: 100, msg: 'Done' })
+      } finally { clearInterval(tick) }
     } catch (e: any) {
       console.error(e)
       setStage('error')
@@ -386,6 +420,8 @@ function EditorInner() {
       setSteps(prev => prev.map((s, j) =>
         j === idx ? { ...s, transcript: merged || s.transcript } : s
       ))
+      setRetranscribedFlash(idx)
+      setTimeout(() => setRetranscribedFlash(curr => curr === idx ? null : curr), 2500)
     } catch (e: any) {
       alert('Re-run failed: ' + (e?.message || e))
     } finally { setRetranscribingIdx(null) }
@@ -510,6 +546,12 @@ function EditorInner() {
         <div className="w-full h-2 rounded-full bg-gray-800 overflow-hidden">
           <div className="h-full bg-brand-500 transition-all" style={{ width: `${progress.pct}%` }} />
         </div>
+        {stage === 'transcribing' && (
+          <p className="text-xs text-amber-300/80 text-center mt-3 leading-relaxed">
+            ⚠️ Keep this tab open. You can switch to other tabs or apps — the work
+            keeps progressing in the background. Closing this tab cancels it.
+          </p>
+        )}
       </div>
     </Center>
   )
@@ -592,6 +634,7 @@ function EditorInner() {
             No steps yet. Add one above.
           </div>
         ) : (
+          <>
           <div className="flex flex-col gap-4 max-w-3xl w-full mx-auto">
             {steps.map((s, i) => (
               <StepCard
@@ -605,9 +648,22 @@ function EditorInner() {
                 onSeekMaster={(t) => { const p = playerRef.current; if (p) { p.currentTime = t; p.pause(); } }}
                 onRetranscribe={() => retranscribeStep(i)}
                 isRetranscribing={retranscribingIdx === i}
+                justRetranscribed={retranscribedFlash === i}
               />
             ))}
           </div>
+          {/* Bottom-of-list add buttons so you don't scroll back to the top */}
+          <div className="max-w-3xl w-full mx-auto flex gap-2 mt-2">
+            <button onClick={addStepHere}
+              className="flex-1 py-2 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-sm font-semibold hover:bg-purple-500/20">
+              + Step at playhead
+            </button>
+            <button onClick={addStepAfterLast}
+              className="flex-1 py-2 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-sm font-semibold hover:bg-purple-500/20">
+              + Step after last
+            </button>
+          </div>
+          </>
         )}
 
         {/* Raw transcript drawer */}
@@ -639,7 +695,7 @@ function fmtTime(s: number) {
 
 function StepCard({
   idx, step, videoUrl, onChange, onDelete, onSetStart, onSetEnd,
-  onMoveUp, onMoveDown, onSeekMaster, onRetranscribe, isRetranscribing,
+  onMoveUp, onMoveDown, onSeekMaster, onRetranscribe, isRetranscribing, justRetranscribed,
 }: {
   idx: number; step: Step; videoUrl: string
   onChange: (p: Partial<Step>) => void
@@ -649,6 +705,7 @@ function StepCard({
   onSeekMaster: (t: number) => void
   onRetranscribe: () => void
   isRetranscribing: boolean
+  justRetranscribed: boolean
 }) {
   const vidRef = useRef<HTMLVideoElement>(null)
   const stopAt = useRef<number | null>(null)
@@ -727,8 +784,12 @@ function StepCard({
             onClick={onRetranscribe}
             disabled={isRetranscribing}
             title="Re-run the speech model on just this clip — short context often = better text"
-            className="text-[11px] text-brand-400 hover:text-brand-300 disabled:opacity-50">
-            {isRetranscribing ? '↻ Re-running…' : '↻ Re-run on this clip'}
+            className={`text-[11px] disabled:opacity-50 ${
+              justRetranscribed ? 'text-emerald-400' : 'text-brand-400 hover:text-brand-300'
+            }`}>
+            {isRetranscribing ? '↻ Re-running… (don\'t close the tab)' :
+             justRetranscribed ? '✓ Re-run done — check below'   :
+             '↻ Re-run on this clip'}
           </button>
         </div>
         <textarea
@@ -736,7 +797,9 @@ function StepCard({
           onChange={e => onChange({ transcript: e.target.value })}
           rows={Math.min(6, Math.max(2, Math.ceil((step.transcript?.length || 0) / 70)))}
           placeholder="(no narration captured for this step)"
-          className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm leading-relaxed text-gray-200 focus:outline-none focus:border-brand-500 resize-y"
+          className={`w-full bg-gray-950 border rounded-lg px-3 py-2 text-sm leading-relaxed text-gray-200 focus:outline-none focus:border-brand-500 resize-y transition-colors ${
+            justRetranscribed ? 'border-emerald-500/60 ring-1 ring-emerald-500/40' : 'border-gray-800'
+          }`}
         />
 
         {/* Time controls */}
