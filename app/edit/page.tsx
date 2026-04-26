@@ -19,8 +19,10 @@ type Sidecar  = {
 }
 
 const MODELS = [
-  { id: 'Xenova/whisper-base',  label: 'Base',  size: '140 MB', blurb: 'Solid all-rounder for narration' },
-  { id: 'Xenova/whisper-small', label: 'Small', size: '250 MB', blurb: 'Best quality, slower (use WebGPU if you have it)' },
+  { id: 'Xenova/whisper-base',                 label: 'Base',          size: '140 MB', blurb: 'Quick start, good for clear narration' },
+  { id: 'Xenova/whisper-small',                label: 'Small',         size: '250 MB', blurb: 'Better names + technical terms' },
+  { id: 'Xenova/whisper-medium',               label: 'Medium',        size: '760 MB', blurb: 'High accuracy, slow on CPU (~10× audio length)' },
+  { id: 'distil-whisper/distil-large-v3',      label: 'Distil Large',  size: '750 MB', blurb: 'Same size as Medium, faster, near top-tier accuracy' },
 ]
 
 // ── Drive helpers ─────────────────────────────────────────────────────────────
@@ -65,12 +67,46 @@ async function findSidecar(videoFileId: string, token: string): Promise<{ id: st
 async function saveSidecar(
   videoFileId: string, videoName: string, sidecar: Sidecar, token: string, existingId: string | null
 ): Promise<string> {
-  const meta: any = {
-    name: videoName.replace(/\.webm$/i, '') + '.copycat.json',
+  // Drive PATCH on /upload doesn't accept the same metadata (notably name +
+  // appProperties) at the same time as content cleanly, so we split into two
+  // calls when updating: PATCH metadata via /drive/v3, then PATCH content via
+  // /upload/drive/v3 with uploadType=media.
+  const baseName = videoName.replace(/\.webm$/i, '') + '.copycat.json'
+  const body     = JSON.stringify(sidecar, null, 2)
+
+  if (existingId) {
+    // 1. Update metadata (name + appProperties)
+    const metaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${existingId}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: baseName, appProperties: { copycatVideoId: videoFileId } }),
+    })
+    if (metaRes.status === 401) throw new Error('AUTH_EXPIRED')
+    if (!metaRes.ok) {
+      const err = await metaRes.json().catch(() => ({}))
+      throw new Error(err?.error?.message || `Sidecar metadata update failed (${metaRes.status})`)
+    }
+    // 2. Replace content
+    const contentRes = await fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=media`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body,
+    })
+    if (contentRes.status === 401) throw new Error('AUTH_EXPIRED')
+    if (!contentRes.ok) {
+      const err = await contentRes.json().catch(() => ({}))
+      throw new Error(err?.error?.message || `Sidecar content update failed (${contentRes.status})`)
+    }
+    return existingId
+  }
+
+  // Create — multipart with metadata + content in one call
+  const meta = {
+    name: baseName,
     mimeType: 'application/json',
     appProperties: { copycatVideoId: videoFileId },
   }
-  const body = JSON.stringify(sidecar, null, 2)
   const boundary = 'cc_' + Date.now()
   const multipart =
     `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
@@ -78,17 +114,15 @@ async function saveSidecar(
     `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n` + body +
     `\r\n--${boundary}--`
 
-  const url = existingId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
-    : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`
-  const res = await fetch(url, {
-    method:  existingId ? 'PATCH' : 'POST',
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+    method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': `multipart/related; boundary="${boundary}"`,
     },
     body: multipart,
   })
+  if (res.status === 401) throw new Error('AUTH_EXPIRED')
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err?.error?.message || `Sidecar save failed (${res.status})`)
@@ -175,6 +209,10 @@ function EditorInner() {
 
   const playerRef = useRef<HTMLVideoElement>(null)
   const stopAtRef = useRef<number | null>(null)
+  // Cache the loaded Whisper pipeline + decoded audio so per-step re-runs are cheap.
+  const whisperRef = useRef<{ model: string, pipe: any } | null>(null)
+  const audioRef   = useRef<Float32Array | null>(null)
+  const [retranscribingIdx, setRetranscribingIdx] = useState<number | null>(null)
 
   // 1. Auth + Drive download + sidecar load
   useEffect(() => {
@@ -241,65 +279,66 @@ function EditorInner() {
   }, [fileId])
 
   // 2. Run transcription
+  // Loads Whisper pipeline (or returns cached one if same model).
+  async function ensureWhisper(modelId: string, onProgress: (pct: number, msg: string) => void) {
+    if (whisperRef.current?.model === modelId) return whisperRef.current.pipe
+    onProgress(15, 'Loading speech model (cached after first run)…')
+    const dynamicImport = new Function('u', 'return import(u)') as (u: string) => Promise<any>
+    const tr = await dynamicImport('https://esm.sh/@huggingface/transformers@3.0.2')
+    tr.env.allowLocalModels = false
+    tr.env.useBrowserCache  = true
+    tr.env.backends.onnx.wasm.numThreads = 1
+    const pipe = await tr.pipeline('automatic-speech-recognition', modelId, {
+      device: 'wasm', dtype: 'q8',
+      progress_callback: (p: any) => {
+        if (p.status === 'progress' && p.progress != null) {
+          onProgress(15 + Math.min(50, p.progress / 2), `Loading ${p.file || 'model'}… ${Math.round(p.progress)}%`)
+        }
+      },
+    })
+    whisperRef.current = { model: modelId, pipe }
+    return pipe
+  }
+
+  // Whisper inference helper — same generation knobs every call.
+  async function runWhisper(pipe: any, audio: Float32Array): Promise<Chunk[]> {
+    const dur = audio.length / 16000
+    const out = await pipe(audio, {
+      chunk_length_s:             30,
+      stride_length_s:            5,
+      return_timestamps:          true,
+      language:                   'en',
+      task:                       'transcribe',
+      no_repeat_ngram_size:       3,
+      repetition_penalty:         1.2,
+      condition_on_previous_text: false,
+    })
+    const raw: Chunk[] = (out.chunks || []).map((c: any) => ({
+      start: c.timestamp?.[0] ?? 0,
+      end:   Math.min(c.timestamp?.[1] ?? dur, dur),
+      text:  (c.text || '').trim(),
+    })).filter((c: Chunk) => c.start <= dur)
+    const clean: Chunk[] = []
+    for (const c of raw) {
+      const last = clean[clean.length - 1]
+      if (last && last.text === c.text) { last.end = c.end; continue }
+      clean.push(c)
+    }
+    return clean
+  }
+
   async function runTranscription() {
     if (!videoBlob) return
     setStage('transcribing')
     setProgress({ pct: 5, msg: 'Decoding audio…' })
     try {
       const audio = await decodeTo16kMono(videoBlob)
-      setProgress({ pct: 15, msg: 'Loading speech model (cached after first run)…' })
-
-      // Dynamic URL import via `new Function` so TypeScript & webpack don't try
-      // to statically resolve the remote module at build time.
-      const dynamicImport = new Function('u', 'return import(u)') as (u: string) => Promise<any>
-      // esm.sh auto-rewrites bare Node imports (fs, path…) to browser-safe
-      // shims so the Whisper bundle loads without a "Failed to resolve module
-      // specifier 'fs'" error that hits with raw jsdelivr .mjs.
-      const tr = await dynamicImport('https://esm.sh/@huggingface/transformers@3.0.2')
-      tr.env.allowLocalModels = false
-      tr.env.useBrowserCache  = true
-      tr.env.backends.onnx.wasm.numThreads = 1
-
-      const pipe = await tr.pipeline('automatic-speech-recognition', model, {
-        device: 'wasm',
-        dtype:  'q8',
-        progress_callback: (p: any) => {
-          if (p.status === 'progress' && p.progress != null) {
-            setProgress({
-              pct: 15 + Math.min(50, p.progress / 2),
-              msg: `Loading ${p.file || 'model'}… ${Math.round(p.progress)}%`,
-            })
-          }
-        },
-      })
-
+      audioRef.current = audio
+      const pipe = await ensureWhisper(model, (pct, msg) => setProgress({ pct, msg }))
       setProgress({ pct: 70, msg: 'Transcribing…' })
-      const dur = audio.length / 16000
-      const out = await pipe(audio, {
-        chunk_length_s:             30,
-        stride_length_s:            5,
-        return_timestamps:          true,
-        language:                   'en',
-        task:                       'transcribe',
-        no_repeat_ngram_size:       3,
-        repetition_penalty:         1.2,
-        condition_on_previous_text: false,
-      })
-
-      // Clean: clamp + dedupe
-      const raw: Chunk[] = (out.chunks || []).map((c: any) => ({
-        start: c.timestamp?.[0] ?? 0,
-        end:   Math.min(c.timestamp?.[1] ?? dur, dur),
-        text:  (c.text || '').trim(),
-      })).filter((c: Chunk) => c.start <= dur)
-      const clean: Chunk[] = []
-      for (const c of raw) {
-        const last = clean[clean.length - 1]
-        if (last && last.text === c.text) { last.end = c.end; continue }
-        clean.push(c)
-      }
-      setTranscript(clean)
-      setSteps(chunksToSteps(clean))
+      const chunks = await runWhisper(pipe, audio)
+      setTranscript(chunks)
+      setSteps(chunksToSteps(chunks))
       setStage('editor')
       setProgress({ pct: 100, msg: 'Done' })
     } catch (e: any) {
@@ -309,9 +348,40 @@ function EditorInner() {
     }
   }
 
+  // Re-transcribe one step (slice audio) — short context often = much better text.
+  async function retranscribeStep(idx: number) {
+    const step = steps[idx]; if (!step) return
+    setRetranscribingIdx(idx)
+    try {
+      if (!audioRef.current && videoBlob) {
+        audioRef.current = await decodeTo16kMono(videoBlob)
+      }
+      if (!audioRef.current) throw new Error('Audio not available')
+      const pipe = await ensureWhisper(model, () => {})
+
+      const startSample = Math.max(0, Math.floor(step.start * 16000))
+      const endSample   = Math.min(audioRef.current.length, Math.ceil(step.end * 16000))
+      const slice       = audioRef.current.subarray(startSample, endSample)
+      if (slice.length < 16000 * 0.4) {
+        alert('Step is shorter than 0.4 s — Whisper needs a bit more audio.')
+        return
+      }
+      const sliceChunks = await runWhisper(pipe, slice)
+      const merged = sliceChunks.map(c => c.text).join(' ').trim()
+      setSteps(prev => prev.map((s, j) =>
+        j === idx ? { ...s, transcript: merged || s.transcript } : s
+      ))
+    } catch (e: any) {
+      alert('Re-run failed: ' + (e?.message || e))
+    } finally { setRetranscribingIdx(null) }
+  }
+
   // 3. Save sidecar
   async function save() {
-    if (!session?.provider_token || !fileId || !videoName) return
+    if (!session?.provider_token || !fileId || !videoName) {
+      alert('Not signed in. Refresh the page to sign back in.')
+      return
+    }
     setSaving(true)
     try {
       const sidecar: Sidecar = {
@@ -323,6 +393,19 @@ function EditorInner() {
       setSidecarId(newId)
       setSavedAt(new Date().toLocaleTimeString())
     } catch (e: any) {
+      if (e?.message === 'AUTH_EXPIRED') {
+        // Silently refresh Google token then retry once user comes back
+        await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: window.location.href,
+            scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
+            queryParams: { access_type: 'offline', prompt: 'none' },
+          },
+        })
+        return
+      }
+      console.error('[edit] save failed:', e)
       alert('Save failed: ' + (e?.message || e))
     } finally { setSaving(false) }
   }
@@ -486,6 +569,8 @@ function EditorInner() {
                 onMoveUp={i > 0   ? () => setSteps(p => swap(p, i, i - 1)) : undefined}
                 onMoveDown={i < steps.length - 1 ? () => setSteps(p => swap(p, i, i + 1)) : undefined}
                 onSeekMaster={(t) => { const p = playerRef.current; if (p) { p.currentTime = t; p.pause(); } }}
+                onRetranscribe={() => retranscribeStep(i)}
+                isRetranscribing={retranscribingIdx === i}
               />
             ))}
           </div>
@@ -519,7 +604,8 @@ function fmtTime(s: number) {
 }
 
 function StepCard({
-  idx, step, videoUrl, onChange, onDelete, onSetStart, onSetEnd, onMoveUp, onMoveDown, onSeekMaster,
+  idx, step, videoUrl, onChange, onDelete, onSetStart, onSetEnd,
+  onMoveUp, onMoveDown, onSeekMaster, onRetranscribe, isRetranscribing,
 }: {
   idx: number; step: Step; videoUrl: string
   onChange: (p: Partial<Step>) => void
@@ -527,6 +613,8 @@ function StepCard({
   onSetStart: () => void; onSetEnd: () => void
   onMoveUp?: () => void; onMoveDown?: () => void
   onSeekMaster: (t: number) => void
+  onRetranscribe: () => void
+  isRetranscribing: boolean
 }) {
   const vidRef = useRef<HTMLVideoElement>(null)
   const stopAt = useRef<number | null>(null)
@@ -599,7 +687,16 @@ function StepCard({
 
       {/* Editable transcript for this step */}
       <div className="p-4 flex flex-col gap-2">
-        <label className="text-[11px] text-gray-500 uppercase tracking-wide">Narration</label>
+        <div className="flex items-center justify-between">
+          <label className="text-[11px] text-gray-500 uppercase tracking-wide">Narration</label>
+          <button
+            onClick={onRetranscribe}
+            disabled={isRetranscribing}
+            title="Re-run the speech model on just this clip — short context often = better text"
+            className="text-[11px] text-brand-400 hover:text-brand-300 disabled:opacity-50">
+            {isRetranscribing ? '↻ Re-running…' : '↻ Re-run on this clip'}
+          </button>
+        </div>
         <textarea
           value={step.transcript}
           onChange={e => onChange({ transcript: e.target.value })}
