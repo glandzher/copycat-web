@@ -442,6 +442,10 @@ function EditorInner() {
             src={videoUrl}
             controls playsInline
             onTimeUpdate={onTimeUpdate}
+            onPlay={(e) => {
+              // Stop any step mini-player so audio doesn't overlap
+              document.querySelectorAll('video').forEach(v => { if (v !== e.currentTarget) v.pause() })
+            }}
             className="w-full rounded-xl bg-black aspect-video max-h-[55vh]"
           />
           <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500">
@@ -471,7 +475,7 @@ function EditorInner() {
             No steps yet. Add one above.
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+          <div className="flex flex-col gap-4 max-w-3xl w-full mx-auto">
             {steps.map((s, i) => (
               <StepCard
                 key={i} idx={i} step={s} videoUrl={videoUrl}
@@ -536,6 +540,8 @@ function StepCard({
 
   function play() {
     const v = vidRef.current; if (!v) return
+    // Pause every other <video> on the page so players don't overlap audio
+    document.querySelectorAll('video').forEach(other => { if (other !== v) other.pause() })
     v.currentTime = step.start
     stopAt.current = step.end
     v.play().catch(() => {})
@@ -549,70 +555,74 @@ function StepCard({
 
   return (
     <div className="bg-gray-900/70 border border-gray-800 rounded-xl overflow-hidden flex flex-col">
-      {/* Mini player with caption overlay */}
-      <div className="relative bg-black aspect-video group cursor-pointer" onClick={play}>
+      {/* Header: step number + label + reorder/delete */}
+      <div className="flex items-center gap-2 px-4 pt-3">
+        <span className="text-[11px] font-bold bg-purple-500 text-white px-2 py-0.5 rounded-full">
+          Step {idx + 1}
+        </span>
+        {editLabel ? (
+          <input
+            autoFocus
+            value={step.label}
+            onChange={e => onChange({ label: e.target.value })}
+            onBlur={() => setEditLabel(false)}
+            onKeyDown={e => { if (e.key === 'Enter') setEditLabel(false) }}
+            className="flex-1 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-sm"
+          />
+        ) : (
+          <button onClick={() => setEditLabel(true)}
+            className="flex-1 text-left text-sm font-semibold truncate hover:text-brand-400">
+            {step.label || <span className="italic text-gray-500">(click to label)</span>}
+          </button>
+        )}
+        <span className="text-[11px] tabular-nums text-gray-400 mr-2">
+          {fmtTime(step.start)}–{fmtTime(step.end)} · {(step.end - step.start).toFixed(1)}s
+        </span>
+        <button onClick={onMoveUp}   disabled={!onMoveUp}   title="Move up"   className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▲</button>
+        <button onClick={onMoveDown} disabled={!onMoveDown} title="Move down" className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▼</button>
+        <button onClick={onDelete}   title="Delete"         className="text-red-400 hover:text-red-300 px-1">✕</button>
+      </div>
+
+      {/* Mini player (sound on, click anywhere to play this clip) */}
+      <div className="relative bg-black aspect-video mt-3 group cursor-pointer" onClick={play}>
         <video
           ref={vidRef}
           src={videoUrl}
-          muted playsInline preload="metadata"
+          playsInline preload="metadata"
           onTimeUpdate={onTU}
           className="w-full h-full object-contain"
         />
-        {/* Step number badge */}
-        <span className="absolute top-2 left-2 text-[11px] font-bold bg-purple-500 text-white px-2 py-0.5 rounded-full shadow">
-          Step {idx + 1}
-        </span>
-        {/* Duration badge */}
-        <span className="absolute top-2 right-2 text-[11px] tabular-nums bg-black/70 text-white px-2 py-0.5 rounded">
-          {fmtTime(step.start)} – {fmtTime(step.end)} · {(step.end - step.start).toFixed(1)}s
-        </span>
-        {/* Play indicator on hover */}
-        <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+        <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
           <span className="bg-white/90 text-black rounded-full w-12 h-12 flex items-center justify-center text-xl font-bold">▶</span>
         </span>
-        {/* Transcript caption overlay (Scribe-style) */}
-        {(step.transcript || step.label) && (
-          <div className="absolute bottom-0 left-0 right-0 px-3 py-2 bg-gradient-to-t from-black/90 to-transparent text-xs leading-snug text-white">
-            <div className="line-clamp-3">{step.transcript || step.label}</div>
-          </div>
-        )}
       </div>
 
-      {/* Editable label + controls */}
-      <div className="p-3 flex flex-col gap-2">
-        <div className="flex items-center gap-1">
-          {editLabel ? (
-            <input
-              autoFocus
-              value={step.label}
-              onChange={e => onChange({ label: e.target.value })}
-              onBlur={() => setEditLabel(false)}
-              onKeyDown={e => { if (e.key === 'Enter') setEditLabel(false) }}
-              className="flex-1 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-sm"
-            />
-          ) : (
-            <button onClick={() => setEditLabel(true)}
-              className="flex-1 text-left text-sm font-semibold truncate hover:text-brand-400">
-              {step.label || <span className="italic text-gray-500">(click to label)</span>}
-            </button>
-          )}
-          <button onClick={onMoveUp}   disabled={!onMoveUp}   title="Move up"   className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▲</button>
-          <button onClick={onMoveDown} disabled={!onMoveDown} title="Move down" className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▼</button>
-          <button onClick={onDelete}   title="Delete"         className="text-red-400 hover:text-red-300 px-1">✕</button>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-gray-400">
+      {/* Editable transcript for this step */}
+      <div className="p-4 flex flex-col gap-2">
+        <label className="text-[11px] text-gray-500 uppercase tracking-wide">Narration</label>
+        <textarea
+          value={step.transcript}
+          onChange={e => onChange({ transcript: e.target.value })}
+          rows={Math.min(6, Math.max(2, Math.ceil((step.transcript?.length || 0) / 70)))}
+          placeholder="(no narration captured for this step)"
+          className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm leading-relaxed text-gray-200 focus:outline-none focus:border-brand-500 resize-y"
+        />
+
+        {/* Time controls */}
+        <div className="flex items-center gap-2 text-[11px] text-gray-400 mt-1">
           <span>Start</span>
           <input type="number" min={0} step={0.1} value={step.start.toFixed(2)}
             onChange={e => onChange({ start: Number(e.target.value) })}
-            className="w-16 bg-gray-950 border border-gray-700 rounded px-1.5 py-0.5" />
-          <button onClick={onSetStart} title="Set to master playhead" className="px-1.5 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱</button>
+            className="w-20 bg-gray-950 border border-gray-700 rounded px-2 py-0.5" />
+          <button onClick={onSetStart} title="Set to master playhead" className="px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱ now</button>
           <span>End</span>
           <input type="number" min={0} step={0.1} value={step.end.toFixed(2)}
             onChange={e => onChange({ end: Number(e.target.value) })}
-            className="w-16 bg-gray-950 border border-gray-700 rounded px-1.5 py-0.5" />
-          <button onClick={onSetEnd} title="Set to master playhead" className="px-1.5 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱</button>
+            className="w-20 bg-gray-950 border border-gray-700 rounded px-2 py-0.5" />
+          <button onClick={onSetEnd} title="Set to master playhead" className="px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱ now</button>
           <button onClick={() => onSeekMaster(step.start)} title="Jump master player here"
             className="ml-auto px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">↥ master</button>
+          <button onClick={play} className="px-3 py-0.5 bg-brand-500 hover:bg-brand-600 text-white rounded font-semibold">▶ Play</button>
         </div>
       </div>
     </div>
