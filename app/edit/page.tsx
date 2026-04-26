@@ -211,9 +211,10 @@ function EditorInner() {
       // Dynamic URL import via `new Function` so TypeScript & webpack don't try
       // to statically resolve the remote module at build time.
       const dynamicImport = new Function('u', 'return import(u)') as (u: string) => Promise<any>
-      const tr = await dynamicImport(
-        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2/dist/transformers.min.mjs'
-      )
+      // esm.sh auto-rewrites bare Node imports (fs, path…) to browser-safe
+      // shims so the Whisper bundle loads without a "Failed to resolve module
+      // specifier 'fs'" error that hits with raw jsdelivr .mjs.
+      const tr = await dynamicImport('https://esm.sh/@huggingface/transformers@3.0.2')
       tr.env.allowLocalModels = false
       tr.env.useBrowserCache  = true
       tr.env.backends.onnx.wasm.numThreads = 1
