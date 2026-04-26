@@ -276,6 +276,11 @@ export default function Dashboard() {
                     className="text-xs font-medium text-gray-600 hover:text-brand-600 border border-gray-200 hover:border-brand-200 px-3 py-1.5 rounded-lg transition-colors">
                     Preview
                   </a>
+                  <a href={`/edit?id=${rec.id}`}
+                    target="_blank" rel="noopener noreferrer"
+                    className="text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-3 py-1.5 rounded-lg transition-colors">
+                    🪄 Step Guide
+                  </a>
                   <button
                     onClick={() => copyLink(rec.id)}
                     className={`text-xs font-medium px-3 py-1.5 rounded-lg transition-colors ${
