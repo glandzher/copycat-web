@@ -222,24 +222,33 @@ function EditorInner() {
       if (!s) { setStage('auth'); return }
       setSession(s)
 
-      // Google access tokens expire after ~1 hour. Supabase keeps the user
-      // signed in but `provider_token` goes stale — a Drive call would 401.
-      // Silently re-run OAuth with prompt=none + redirect to this URL: Google
-      // returns a fresh provider_token without any user-visible consent screen
-      // when the user is already signed in to Google.
+      // Google access tokens expire after ~1 hour. Re-run OAuth to refresh.
+      // ONE attempt only — sessionStorage guards against infinite redirect loops
+      // (which happen when Google can't issue a token silently and bounces back
+      // without one).
       let token = s.provider_token
       if (!token) {
+        const FLAG = 'cc_drive_refresh_attempted'
+        if (sessionStorage.getItem(FLAG)) {
+          sessionStorage.removeItem(FLAG)
+          setStage('error')
+          setError('Google Drive access expired. Click "Reconnect Drive" below.')
+          return
+        }
+        sessionStorage.setItem(FLAG, '1')
         setProgress({ pct: 5, msg: 'Refreshing Google Drive access…' })
         await supabase.auth.signInWithOAuth({
           provider: 'google',
           options: {
             redirectTo: window.location.href,
             scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
-            queryParams: { access_type: 'offline', prompt: 'none' },
+            queryParams: { access_type: 'offline' },
           },
         })
-        return // browser navigates away; effect will rerun after redirect
+        return
       }
+      // Got a token — clear any leftover flag from a prior attempt
+      sessionStorage.removeItem('cc_drive_refresh_attempted')
 
       try {
         setProgress({ pct: 10, msg: 'Fetching video metadata…' })
@@ -259,15 +268,21 @@ function EditorInner() {
           setStage('pre')
         }
       } catch (e: any) {
-        // If the token had expired since we last saw it, retry with silent re-OAuth
         if (e?.message === 'AUTH_EXPIRED') {
+          const FLAG = 'cc_drive_refresh_attempted'
+          if (sessionStorage.getItem(FLAG)) {
+            sessionStorage.removeItem(FLAG)
+            setStage('error'); setError('Google Drive access expired. Click "Reconnect Drive" below.')
+            return
+          }
+          sessionStorage.setItem(FLAG, '1')
           setProgress({ pct: 5, msg: 'Refreshing Google Drive access…' })
           await supabase.auth.signInWithOAuth({
             provider: 'google',
             options: {
               redirectTo: window.location.href,
               scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
-              queryParams: { access_type: 'offline', prompt: 'none' },
+              queryParams: { access_type: 'offline' },
             },
           })
           return
@@ -465,7 +480,26 @@ function EditorInner() {
   if (stage === 'error') return (
     <Center>
       <p className="text-red-300 max-w-md text-center">⚠ {error}</p>
-      <a href="/dashboard" className="mt-4 text-brand-400 underline">Back to dashboard</a>
+      <div className="flex gap-3 mt-4">
+        <button
+          onClick={async () => {
+            sessionStorage.removeItem('cc_drive_refresh_attempted')
+            await supabase.auth.signInWithOAuth({
+              provider: 'google',
+              options: {
+                redirectTo: window.location.href,
+                scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
+                queryParams: { access_type: 'offline' },
+              },
+            })
+          }}
+          className="px-4 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-white font-semibold">
+          Reconnect Drive
+        </button>
+        <a href="/dashboard" className="px-4 py-2 rounded-lg border border-gray-700 text-gray-300 hover:bg-gray-800">
+          Back to dashboard
+        </a>
+      </div>
     </Center>
   )
 
