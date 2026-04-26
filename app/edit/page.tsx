@@ -26,16 +26,19 @@ const MODELS = [
 // ── Drive helpers ─────────────────────────────────────────────────────────────
 
 async function fetchDriveFile(fileId: string, token: string): Promise<{ name: string, blob: Blob }> {
-  const meta = await fetch(
+  const metaRes = await fetch(
     `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType`,
     { headers: { Authorization: `Bearer ${token}` } }
-  ).then(r => r.json())
+  )
+  if (metaRes.status === 401) throw new Error('AUTH_EXPIRED')
+  const meta = await metaRes.json()
   if (meta.error) throw new Error(meta.error.message || 'Drive metadata fetch failed')
 
   const dl = await fetch(
     `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
     { headers: { Authorization: `Bearer ${token}` } }
   )
+  if (dl.status === 401) throw new Error('AUTH_EXPIRED')
   if (!dl.ok) throw new Error(`Drive download failed (${dl.status})`)
   const blob = await dl.blob()
   return { name: meta.name, blob: new Blob([blob], { type: meta.mimeType || 'video/webm' }) }
@@ -180,8 +183,25 @@ function EditorInner() {
       const { data: { session: s } } = await supabase.auth.getSession()
       if (!s) { setStage('auth'); return }
       setSession(s)
-      const token = s.provider_token
-      if (!token) { setStage('error'); setError('No Drive token. Sign out and back in.'); return }
+
+      // Google access tokens expire after ~1 hour. Supabase keeps the user
+      // signed in but `provider_token` goes stale — a Drive call would 401.
+      // Silently re-run OAuth with prompt=none + redirect to this URL: Google
+      // returns a fresh provider_token without any user-visible consent screen
+      // when the user is already signed in to Google.
+      let token = s.provider_token
+      if (!token) {
+        setProgress({ pct: 5, msg: 'Refreshing Google Drive access…' })
+        await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: window.location.href,
+            scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
+            queryParams: { access_type: 'offline', prompt: 'none' },
+          },
+        })
+        return // browser navigates away; effect will rerun after redirect
+      }
 
       try {
         setProgress({ pct: 10, msg: 'Fetching video metadata…' })
@@ -201,6 +221,19 @@ function EditorInner() {
           setStage('pre')
         }
       } catch (e: any) {
+        // If the token had expired since we last saw it, retry with silent re-OAuth
+        if (e?.message === 'AUTH_EXPIRED') {
+          setProgress({ pct: 5, msg: 'Refreshing Google Drive access…' })
+          await supabase.auth.signInWithOAuth({
+            provider: 'google',
+            options: {
+              redirectTo: window.location.href,
+              scopes: 'email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
+              queryParams: { access_type: 'offline', prompt: 'none' },
+            },
+          })
+          return
+        }
         setStage('error'); setError(e?.message || String(e))
       }
     })()
