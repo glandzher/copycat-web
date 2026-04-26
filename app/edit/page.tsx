@@ -8,7 +8,7 @@ import type { Session } from '@supabase/supabase-js'
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type Chunk    = { start: number; end: number; text: string }
-type Step     = { start: number; end: number; label: string }
+type Step     = { start: number; end: number; label: string; transcript: string }
 type Sidecar  = {
   version: 1
   videoFileId: string
@@ -19,9 +19,8 @@ type Sidecar  = {
 }
 
 const MODELS = [
-  { id: 'Xenova/whisper-tiny', label: 'Tiny',  size: '75 MB',  blurb: 'Fast, decent for clear English' },
-  { id: 'Xenova/whisper-base', label: 'Base',  size: '140 MB', blurb: 'Slower, much more accurate' },
-  { id: 'Xenova/whisper-small', label: 'Small', size: '250 MB', blurb: 'Best WASM quality, needs WebGPU for speed' },
+  { id: 'Xenova/whisper-base',  label: 'Base',  size: '140 MB', blurb: 'Solid all-rounder for narration' },
+  { id: 'Xenova/whisper-small', label: 'Small', size: '250 MB', blurb: 'Best quality, slower (use WebGPU if you have it)' },
 ]
 
 // ── Drive helpers ─────────────────────────────────────────────────────────────
@@ -116,26 +115,35 @@ async function decodeTo16kMono(blob: Blob): Promise<Float32Array> {
 }
 
 // ── Step detection from transcript ────────────────────────────────────────────
-// Looks for "step <n>", "step one", "first/next/then", etc. at chunk boundaries.
-
-const STEP_RE = /\b(step\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)|first|next|then|finally|after that)\b/i
+// Boundary triggers: explicit "step N", number words, ordinals, sequencers.
+// The boundary phrase must appear near the START of the chunk to count as a
+// new step (avoids false positives mid-sentence like "...go to the next page").
+const ORDINALS  = 'first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth'
+const NUMBERS   = 'one|two|three|four|five|six|seven|eight|nine|ten|\\d+'
+const SEQUENCER = 'next|then|after that|now|finally|lastly|moving on'
+const STEP_RE   = new RegExp(
+  `^\\s*(?:(?:step|étape|paso|schritt)\\s+(?:${NUMBERS})\\b|(?:${ORDINALS})[\\s,]|(?:${SEQUENCER})[\\s,])`,
+  'i'
+)
+// Also fire if a chunk STARTS with a digit + dot/colon ("1. open the…")
+const NUMBERED_LINE = /^\s*\d+\s*[.:)]\s+/
 
 function chunksToSteps(chunks: Chunk[]): Step[] {
   if (chunks.length === 0) return []
+  const isBoundary = (text: string) => STEP_RE.test(text) || NUMBERED_LINE.test(text)
   const steps: Step[] = []
-  let cur: { start: number; end: number; label: string } | null = null
+  let cur: Step | null = null
   for (const c of chunks) {
-    if (STEP_RE.test(c.text) || cur === null) {
+    if (cur === null || isBoundary(c.text)) {
       if (cur) steps.push(cur)
-      cur = { start: c.start, end: c.end, label: c.text.slice(0, 60) }
+      cur = { start: c.start, end: c.end, label: c.text.slice(0, 60), transcript: c.text }
     } else {
-      cur.end = c.end
-      // grow label if still short
+      cur.end        = c.end
+      cur.transcript = (cur.transcript + ' ' + c.text).trim()
       if (cur.label.length < 40) cur.label = (cur.label + ' ' + c.text).slice(0, 60)
     }
   }
   if (cur) steps.push(cur)
-  // Renumber labels if they don't already start with "Step"
   return steps.map((s, i) =>
     /^step\b/i.test(s.label) ? s : { ...s, label: `Step ${i + 1}: ${s.label}` }
   )
@@ -155,7 +163,7 @@ function EditorInner() {
   const [videoUrl,    setVideoUrl]    = useState<string>('')
   const [videoName,   setVideoName]   = useState<string>('')
   const [videoBlob,   setVideoBlob]   = useState<Blob | null>(null)
-  const [model,       setModel]       = useState<string>('Xenova/whisper-tiny')
+  const [model,       setModel]       = useState<string>('Xenova/whisper-base')
   const [transcript,  setTranscript]  = useState<Chunk[]>([])
   const [steps,       setSteps]       = useState<Step[]>([])
   const [sidecarId,   setSidecarId]   = useState<string | null>(null)
@@ -311,7 +319,22 @@ function EditorInner() {
   function addStepHere() {
     const p = playerRef.current; if (!p) return
     const t = p.currentTime; const dur = p.duration || (t + 5)
-    setSteps(s => [...s, { start: +t.toFixed(2), end: +Math.min(t + 5, dur).toFixed(2), label: `Step ${s.length + 1}` }])
+    setSteps(s => [...s, {
+      start: +t.toFixed(2), end: +Math.min(t + 5, dur).toFixed(2),
+      label: `Step ${s.length + 1}`, transcript: '',
+    }])
+  }
+
+  function addStepAfterLast() {
+    const p = playerRef.current; if (!p) return
+    const dur = p.duration || 0
+    const last = steps[steps.length - 1]
+    const start = last ? last.end : 0
+    if (start >= dur) return
+    setSteps(s => [...s, {
+      start, end: Math.min(start + 5, dur),
+      label: `Step ${s.length + 1}`, transcript: '',
+    }])
   }
 
   // ── Render ────────────────────────────────────────────────────────────────────
@@ -378,61 +401,71 @@ function EditorInner() {
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col">
       <TopBar fileId={fileId} />
-      <main className="flex-1 max-w-6xl w-full mx-auto p-4 grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-4">
+      <main className="flex-1 max-w-6xl w-full mx-auto p-4 flex flex-col gap-5">
+        {/* Master video + meta + actions */}
         <section className="flex flex-col gap-3">
           <video
             ref={playerRef}
             src={videoUrl}
             controls playsInline
             onTimeUpdate={onTimeUpdate}
-            className="w-full rounded-xl bg-black aspect-video"
+            className="w-full rounded-xl bg-black aspect-video max-h-[55vh]"
           />
-          <div className="text-xs text-gray-500">
-            {videoName} · {steps.length} step{steps.length === 1 ? '' : 's'}
-            {savedAt && <span className="ml-2 text-emerald-400">✓ saved at {savedAt}</span>}
-          </div>
-          <details className="rounded-lg bg-gray-900/50 p-3 text-xs">
-            <summary className="cursor-pointer text-gray-400">Raw transcript ({transcript.length} chunks)</summary>
-            <div className="mt-2 max-h-48 overflow-y-auto leading-relaxed">
-              {transcript.map((c, i) => (
-                <div key={i} className="mb-1">
-                  <span className="text-gray-500 tabular-nums mr-2">{fmtTime(c.start)}–{fmtTime(c.end)}</span>
-                  {c.text}
-                </div>
-              ))}
+          <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500">
+            <span className="truncate">{videoName}</span>
+            <span>· {steps.length} step{steps.length === 1 ? '' : 's'}</span>
+            {savedAt && <span className="text-emerald-400">✓ saved at {savedAt}</span>}
+            <div className="ml-auto flex gap-2">
+              <button onClick={addStepHere}
+                className="px-3 py-1.5 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-xs font-semibold hover:bg-purple-500/20">
+                + Step at playhead
+              </button>
+              <button onClick={addStepAfterLast} disabled={!steps.length}
+                className="px-3 py-1.5 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-xs font-semibold hover:bg-purple-500/20 disabled:opacity-40">
+                + Step after last
+              </button>
+              <button onClick={save} disabled={saving}
+                className="px-4 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold disabled:opacity-50">
+                {saving ? 'Saving…' : '💾 Save'}
+              </button>
             </div>
-          </details>
+          </div>
         </section>
 
-        <aside className="flex flex-col gap-3 max-h-[calc(100vh-120px)]">
-          <div className="flex gap-2">
-            <button onClick={addStepHere}
-              className="flex-1 py-2 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-sm font-semibold hover:bg-purple-500/20">
-              + Add step at current time
-            </button>
-            <button onClick={save} disabled={saving}
-              className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white font-semibold disabled:opacity-50">
-              {saving ? 'Saving…' : '💾 Save'}
-            </button>
+        {/* Step grid */}
+        {steps.length === 0 ? (
+          <div className="text-sm text-gray-500 text-center py-8 border border-dashed border-gray-800 rounded-xl">
+            No steps yet. Add one above.
           </div>
-          <div className="flex-1 overflow-y-auto flex flex-col gap-2 pr-1">
-            {steps.length === 0 && (
-              <div className="text-sm text-gray-500 text-center py-8">No steps yet. Add one above.</div>
-            )}
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             {steps.map((s, i) => (
-              <StepRow
-                key={i} idx={i} step={s}
+              <StepCard
+                key={i} idx={i} step={s} videoUrl={videoUrl}
                 onChange={(patch) => setSteps(prev => prev.map((x, j) => j === i ? { ...x, ...patch } : x))}
                 onDelete={() => setSteps(prev => prev.filter((_, j) => j !== i))}
-                onPlay={() => playClip(s.start, s.end)}
                 onSetStart={() => setStepStartToNow(i)}
                 onSetEnd={() => setStepEndToNow(i)}
                 onMoveUp={i > 0   ? () => setSteps(p => swap(p, i, i - 1)) : undefined}
                 onMoveDown={i < steps.length - 1 ? () => setSteps(p => swap(p, i, i + 1)) : undefined}
+                onSeekMaster={(t) => { const p = playerRef.current; if (p) { p.currentTime = t; p.pause(); } }}
               />
             ))}
           </div>
-        </aside>
+        )}
+
+        {/* Raw transcript drawer */}
+        <details className="rounded-lg bg-gray-900/50 p-3 text-xs">
+          <summary className="cursor-pointer text-gray-400">Raw transcript ({transcript.length} chunks)</summary>
+          <div className="mt-2 max-h-64 overflow-y-auto leading-relaxed">
+            {transcript.map((c, i) => (
+              <div key={i} className="mb-1">
+                <span className="text-gray-500 tabular-nums mr-2">{fmtTime(c.start)}–{fmtTime(c.end)}</span>
+                {c.text}
+              </div>
+            ))}
+          </div>
+        </details>
       </main>
     </div>
   )
@@ -448,38 +481,106 @@ function fmtTime(s: number) {
   return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}.${ms}`
 }
 
-function StepRow({ idx, step, onChange, onDelete, onPlay, onSetStart, onSetEnd, onMoveUp, onMoveDown }: {
-  idx: number; step: Step
+function StepCard({
+  idx, step, videoUrl, onChange, onDelete, onSetStart, onSetEnd, onMoveUp, onMoveDown, onSeekMaster,
+}: {
+  idx: number; step: Step; videoUrl: string
   onChange: (p: Partial<Step>) => void
-  onDelete: () => void; onPlay: () => void
+  onDelete: () => void
   onSetStart: () => void; onSetEnd: () => void
   onMoveUp?: () => void; onMoveDown?: () => void
+  onSeekMaster: (t: number) => void
 }) {
+  const vidRef = useRef<HTMLVideoElement>(null)
+  const stopAt = useRef<number | null>(null)
+  const [editLabel, setEditLabel] = useState(false)
+
+  // Snap to step.start on mount + whenever start changes (so the poster shows the step's first frame)
+  useEffect(() => {
+    const v = vidRef.current; if (!v) return
+    v.currentTime = step.start
+  }, [step.start, videoUrl])
+
+  function play() {
+    const v = vidRef.current; if (!v) return
+    v.currentTime = step.start
+    stopAt.current = step.end
+    v.play().catch(() => {})
+  }
+  function onTU(e: React.SyntheticEvent<HTMLVideoElement>) {
+    const v = e.currentTarget
+    if (stopAt.current != null && v.currentTime >= stopAt.current) {
+      v.pause(); v.currentTime = step.start; stopAt.current = null
+    }
+  }
+
   return (
-    <div className="bg-gray-900/70 border border-gray-800 rounded-xl p-3 flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <span className="text-xs font-bold bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">{idx + 1}</span>
-        <input
-          value={step.label}
-          onChange={e => onChange({ label: e.target.value })}
-          className="flex-1 bg-transparent border-b border-gray-700 px-1 py-0.5 text-sm focus:outline-none focus:border-brand-500"
+    <div className="bg-gray-900/70 border border-gray-800 rounded-xl overflow-hidden flex flex-col">
+      {/* Mini player with caption overlay */}
+      <div className="relative bg-black aspect-video group cursor-pointer" onClick={play}>
+        <video
+          ref={vidRef}
+          src={videoUrl}
+          muted playsInline preload="metadata"
+          onTimeUpdate={onTU}
+          className="w-full h-full object-contain"
         />
-        <button onClick={onMoveUp}   disabled={!onMoveUp}   className="text-gray-500 hover:text-gray-200 disabled:opacity-30">▲</button>
-        <button onClick={onMoveDown} disabled={!onMoveDown} className="text-gray-500 hover:text-gray-200 disabled:opacity-30">▼</button>
-        <button onClick={onDelete}   className="text-red-400 hover:text-red-300">✕</button>
+        {/* Step number badge */}
+        <span className="absolute top-2 left-2 text-[11px] font-bold bg-purple-500 text-white px-2 py-0.5 rounded-full shadow">
+          Step {idx + 1}
+        </span>
+        {/* Duration badge */}
+        <span className="absolute top-2 right-2 text-[11px] tabular-nums bg-black/70 text-white px-2 py-0.5 rounded">
+          {fmtTime(step.start)} – {fmtTime(step.end)} · {(step.end - step.start).toFixed(1)}s
+        </span>
+        {/* Play indicator on hover */}
+        <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+          <span className="bg-white/90 text-black rounded-full w-12 h-12 flex items-center justify-center text-xl font-bold">▶</span>
+        </span>
+        {/* Transcript caption overlay (Scribe-style) */}
+        {(step.transcript || step.label) && (
+          <div className="absolute bottom-0 left-0 right-0 px-3 py-2 bg-gradient-to-t from-black/90 to-transparent text-xs leading-snug text-white">
+            <div className="line-clamp-3">{step.transcript || step.label}</div>
+          </div>
+        )}
       </div>
-      <div className="flex items-center gap-2 text-xs text-gray-400">
-        <span>Start</span>
-        <input type="number" min={0} step={0.1} value={step.start.toFixed(2)}
-          onChange={e => onChange({ start: Number(e.target.value) })}
-          className="w-20 bg-gray-950 border border-gray-700 rounded px-2 py-0.5" />
-        <button onClick={onSetStart} className="px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱ now</button>
-        <span>End</span>
-        <input type="number" min={0} step={0.1} value={step.end.toFixed(2)}
-          onChange={e => onChange({ end: Number(e.target.value) })}
-          className="w-20 bg-gray-950 border border-gray-700 rounded px-2 py-0.5" />
-        <button onClick={onSetEnd} className="px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱ now</button>
-        <button onClick={onPlay} className="ml-auto px-3 py-0.5 bg-brand-500 hover:bg-brand-600 text-white rounded font-semibold">▶ Play</button>
+
+      {/* Editable label + controls */}
+      <div className="p-3 flex flex-col gap-2">
+        <div className="flex items-center gap-1">
+          {editLabel ? (
+            <input
+              autoFocus
+              value={step.label}
+              onChange={e => onChange({ label: e.target.value })}
+              onBlur={() => setEditLabel(false)}
+              onKeyDown={e => { if (e.key === 'Enter') setEditLabel(false) }}
+              className="flex-1 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-sm"
+            />
+          ) : (
+            <button onClick={() => setEditLabel(true)}
+              className="flex-1 text-left text-sm font-semibold truncate hover:text-brand-400">
+              {step.label || <span className="italic text-gray-500">(click to label)</span>}
+            </button>
+          )}
+          <button onClick={onMoveUp}   disabled={!onMoveUp}   title="Move up"   className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▲</button>
+          <button onClick={onMoveDown} disabled={!onMoveDown} title="Move down" className="text-gray-500 hover:text-gray-200 disabled:opacity-30 px-1">▼</button>
+          <button onClick={onDelete}   title="Delete"         className="text-red-400 hover:text-red-300 px-1">✕</button>
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-gray-400">
+          <span>Start</span>
+          <input type="number" min={0} step={0.1} value={step.start.toFixed(2)}
+            onChange={e => onChange({ start: Number(e.target.value) })}
+            className="w-16 bg-gray-950 border border-gray-700 rounded px-1.5 py-0.5" />
+          <button onClick={onSetStart} title="Set to master playhead" className="px-1.5 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱</button>
+          <span>End</span>
+          <input type="number" min={0} step={0.1} value={step.end.toFixed(2)}
+            onChange={e => onChange({ end: Number(e.target.value) })}
+            className="w-16 bg-gray-950 border border-gray-700 rounded px-1.5 py-0.5" />
+          <button onClick={onSetEnd} title="Set to master playhead" className="px-1.5 py-0.5 border border-gray-700 rounded hover:bg-gray-800">⏱</button>
+          <button onClick={() => onSeekMaster(step.start)} title="Jump master player here"
+            className="ml-auto px-2 py-0.5 border border-gray-700 rounded hover:bg-gray-800">↥ master</button>
+        </div>
       </div>
     </div>
   )
