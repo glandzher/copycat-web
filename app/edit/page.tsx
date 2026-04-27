@@ -4,6 +4,10 @@ import { Suspense, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import type { Session } from '@supabase/supabase-js'
+import {
+  isFileSystemAccessSupported,
+  rememberDirHandle, recallDirHandle, ensurePermission,
+} from '@/lib/localStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -191,6 +195,11 @@ function chunksToSteps(chunks: Chunk[]): Step[] {
 function EditorInner() {
   const params  = useSearchParams()
   const fileId  = params.get('id')
+  const source  = (params.get('source') || (fileId ? 'drive' : '')) as 'drive' | 'local' | ''
+  const localName = params.get('name') || ''           // for source=local: video filename
+  const localFolderLabel = params.get('folder') || 'default' // IndexedDB key
+  const isLocal = source === 'local'
+  const localDirRef = useRef<FileSystemDirectoryHandle | null>(null)
 
   const [session,  setSession]  = useState<Session | null>(null)
   const [stage,    setStage]    = useState<'auth' | 'loading' | 'pre' | 'transcribing' | 'editor' | 'error'>('loading')
@@ -224,9 +233,10 @@ function EditorInner() {
     return () => window.removeEventListener('beforeunload', handler)
   }, [stage, retranscribingIdx, saving])
 
-  // 1. Auth + Drive download + sidecar load
+  // 1. Load video + sidecar (either from Drive OR from a local folder)
   useEffect(() => {
     (async () => {
+      if (isLocal) { await loadLocal(); return }
       if (!fileId) { setStage('error'); setError('No video id in URL'); return }
       const { data: { session: s } } = await supabase.auth.getSession()
       if (!s) { setStage('auth'); return }
@@ -352,6 +362,94 @@ function EditorInner() {
     return clean
   }
 
+  // ── Local folder mode ────────────────────────────────────────────────────────
+  async function pickFolder(): Promise<FileSystemDirectoryHandle | null> {
+    if (!isFileSystemAccessSupported()) {
+      setStage('error')
+      setError('This browser does not support local-folder mode. Use Chrome, Edge, Brave, or Arc.')
+      return null
+    }
+    try {
+      // @ts-ignore — Chromium-only
+      const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
+      await rememberDirHandle(localFolderLabel, handle)
+      return handle
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        setStage('error'); setError(e?.message || String(e))
+      }
+      return null
+    }
+  }
+
+  async function readLocalFile(dir: FileSystemDirectoryHandle, name: string): Promise<File> {
+    const fh = await dir.getFileHandle(name)
+    return await fh.getFile()
+  }
+
+  async function tryReadSidecar(dir: FileSystemDirectoryHandle, baseName: string): Promise<Sidecar | null> {
+    try {
+      const fh = await dir.getFileHandle(baseName + '.copycat.json')
+      const f  = await fh.getFile()
+      return JSON.parse(await f.text())
+    } catch { return null }
+  }
+
+  async function loadLocal() {
+    setProgress({ pct: 5, msg: 'Looking for the folder you picked earlier…' })
+    let dir = await recallDirHandle(localFolderLabel)
+    let perm = false
+    if (dir) perm = await ensurePermission(dir, 'readwrite')
+
+    if (!dir || !perm) {
+      setStage('pre')
+      return
+    }
+
+    localDirRef.current = dir
+    try {
+      setProgress({ pct: 25, msg: `Reading ${localName}…` })
+      const file = await readLocalFile(dir, localName)
+      setVideoName(file.name)
+      setVideoBlob(file)
+      setVideoUrl(URL.createObjectURL(file))
+      const baseName = localName.replace(/\.webm$/i, '')
+      const sc = await tryReadSidecar(dir, baseName)
+      if (sc) {
+        setTranscript(sc.transcript || [])
+        setSteps(sc.chapters || [])
+        setStage('editor')
+      } else {
+        setStage('pre')
+      }
+    } catch (e: any) {
+      setStage('error'); setError(e?.message || String(e))
+    }
+  }
+
+  async function pickFolderAndLoad() {
+    const dir = await pickFolder()
+    if (!dir) return
+    localDirRef.current = dir
+    setProgress({ pct: 25, msg: `Reading ${localName}…` })
+    try {
+      const file = await readLocalFile(dir, localName)
+      setVideoName(file.name)
+      setVideoBlob(file)
+      setVideoUrl(URL.createObjectURL(file))
+      const sc = await tryReadSidecar(dir, localName.replace(/\.webm$/i, ''))
+      if (sc) {
+        setTranscript(sc.transcript || [])
+        setSteps(sc.chapters || [])
+        setStage('editor')
+      } else {
+        setStage('pre')
+      }
+    } catch (e: any) {
+      setStage('error'); setError(e?.message || `Couldn't find ${localName} in that folder.`)
+    }
+  }
+
   async function runTranscription() {
     if (!videoBlob) return
     setStage('transcribing')
@@ -427,18 +525,33 @@ function EditorInner() {
     } finally { setRetranscribingIdx(null) }
   }
 
-  // 3. Save sidecar
+  // 3. Save sidecar (local OR Drive depending on source)
   async function save() {
-    if (!session?.provider_token || !fileId || !videoName) {
-      alert('Not signed in. Refresh the page to sign back in.')
-      return
-    }
+    if (!videoName) return
     setSaving(true)
     try {
       const sidecar: Sidecar = {
-        version: 1, videoFileId: fileId,
+        version: 1, videoFileId: fileId || `local:${videoName}`,
         transcript, chapters: steps,
         model, updatedAt: new Date().toISOString(),
+      }
+
+      if (isLocal) {
+        const dir = localDirRef.current
+        if (!dir) throw new Error('Folder handle missing')
+        const baseName = videoName.replace(/\.webm$/i, '')
+        const fh = await dir.getFileHandle(baseName + '.copycat.json', { create: true })
+        const w  = await fh.createWritable()
+        await w.write(JSON.stringify(sidecar, null, 2))
+        await w.close()
+        setSavedAt(new Date().toLocaleTimeString() + ' (local)')
+        setSaving(false)
+        return
+      }
+
+      if (!session?.provider_token || !fileId) {
+        alert('Not signed in. Refresh the page to sign back in.')
+        setSaving(false); return
       }
       const newId = await saveSidecar(fileId, videoName, sidecar, session.provider_token, sidecarId)
       setSidecarId(newId)
@@ -459,6 +572,35 @@ function EditorInner() {
       console.error('[edit] save failed:', e)
       alert('Save failed: ' + (e?.message || e))
     } finally { setSaving(false) }
+  }
+
+  // 3b. Export shareable package (video + sidecar in a single .zip)
+  async function exportPackage() {
+    if (!videoBlob || !videoName) { alert('Video not loaded'); return }
+    const sidecar: Sidecar = {
+      version: 1, videoFileId: fileId || `local:${videoName}`,
+      transcript, chapters: steps,
+      model, updatedAt: new Date().toISOString(),
+    }
+    const baseName = videoName.replace(/\.webm$/i, '')
+    try {
+      const JSZip = (await import('jszip')).default
+      const zip = new JSZip()
+      zip.file(`${baseName}.webm`,           videoBlob)
+      zip.file(`${baseName}.copycat.json`,   JSON.stringify(sidecar, null, 2))
+      zip.file('README.txt',
+        `Copycat step-guide package
+Open https://copycat-web-mocha.vercel.app/view in your browser, then drag this .zip onto the page.
+The video and step guide will load entirely in your browser — nothing is uploaded.`)
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href = url; a.download = `${baseName}.copycat.zip`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 5000)
+    } catch (e: any) {
+      alert('Export failed: ' + (e?.message || e))
+    }
   }
 
   // 4. Step play helper
@@ -562,6 +704,20 @@ function EditorInner() {
       <main className="flex-1 flex items-center justify-center p-6">
         <div className="w-full max-w-2xl flex flex-col gap-5">
           <h1 className="text-2xl font-bold">Generate a Step Guide from your narration</h1>
+
+          {isLocal && !videoBlob && (
+            <div className="flex flex-col gap-3 p-4 rounded-xl border-2 border-amber-500/40 bg-amber-500/10">
+              <div className="text-sm">
+                <strong>Local-folder mode.</strong> Pick the folder containing <code className="bg-black/40 px-1 rounded">{localName}</code>.
+                Your video stays on your computer — nothing is uploaded.
+              </div>
+              <button onClick={pickFolderAndLoad}
+                className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-black font-semibold">
+                📁 Pick folder
+              </button>
+            </div>
+          )}
+
           <p className="text-sm text-gray-400">
             Pick a model. Larger = more accurate but slower. The model downloads once to your browser, then
             stays cached. Audio never leaves your device — Whisper runs locally in your browser via WebAssembly.
@@ -581,8 +737,9 @@ function EditorInner() {
             ))}
           </div>
           <button onClick={runTranscription}
-            className="w-full py-3 rounded-xl bg-brand-500 hover:bg-brand-600 font-semibold">
-            Start transcription →
+            disabled={!videoBlob}
+            className="w-full py-3 rounded-xl bg-brand-500 hover:bg-brand-600 font-semibold disabled:opacity-40 disabled:cursor-not-allowed">
+            {videoBlob ? 'Start transcription →' : 'Pick the folder above first'}
           </button>
         </div>
       </main>
@@ -620,9 +777,14 @@ function EditorInner() {
                 className="px-3 py-1.5 rounded-lg bg-purple-500/10 border border-purple-500/40 text-purple-300 text-xs font-semibold hover:bg-purple-500/20 disabled:opacity-40">
                 + Step after last
               </button>
+              <button onClick={exportPackage}
+                title="Bundle the video + step guide into a single .zip you can email or drop onto Copycat to view."
+                className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/40 text-amber-300 text-xs font-semibold hover:bg-amber-500/20">
+                📦 Share package
+              </button>
               <button onClick={save} disabled={saving}
                 className="px-4 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold disabled:opacity-50">
-                {saving ? 'Saving…' : '💾 Save'}
+                {saving ? 'Saving…' : isLocal ? '💾 Save (to folder)' : '💾 Save'}
               </button>
             </div>
           </div>

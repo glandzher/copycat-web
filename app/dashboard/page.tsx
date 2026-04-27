@@ -4,6 +4,10 @@ import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
 import type { User, Session } from '@supabase/supabase-js'
+import {
+  isFileSystemAccessSupported,
+  rememberDirHandle, recallDirHandle, ensurePermission,
+} from '@/lib/localStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -81,6 +85,9 @@ export default function Dashboard() {
   const [loading, setLoading]       = useState(true)
   const [driveError, setDriveError] = useState(false)
   const [copied, setCopied]         = useState<string | null>(null)
+  const [localFiles, setLocalFiles] = useState<{ name: string, size: number }[]>([])
+  const [localLabel, setLocalLabel] = useState<string>('')
+  const [localBusy,  setLocalBusy]  = useState(false)
 
   useEffect(() => {
     supabase.auth.getSession().then(async ({ data: { session } }) => {
@@ -132,6 +139,58 @@ export default function Dashboard() {
 
     setRecordings(merged)
     setLoading(false)
+  }
+
+  // ── Local folder helpers (Phase 6) ─────────────────────────────────────────
+  async function listWebmsInFolder(handle: FileSystemDirectoryHandle): Promise<{ name: string, size: number }[]> {
+    const out: { name: string, size: number }[] = []
+    // @ts-ignore — Chromium iterates with for-await
+    for await (const entry of handle.values()) {
+      if (entry.kind === 'file' && /\.webm$/i.test(entry.name)) {
+        try {
+          const f = await entry.getFile()
+          out.push({ name: entry.name, size: f.size })
+        } catch {}
+      }
+    }
+    out.sort((a, b) => a.name < b.name ? 1 : -1)
+    return out
+  }
+
+  async function pickLocalFolder() {
+    if (!isFileSystemAccessSupported()) {
+      alert('Local-folder mode needs Chrome / Edge / Brave / Arc.')
+      return
+    }
+    setLocalBusy(true)
+    try {
+      // @ts-ignore
+      const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
+      const label = (handle as any).name || 'folder'
+      await rememberDirHandle(label, handle)
+      setLocalLabel(label)
+      setLocalFiles(await listWebmsInFolder(handle))
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') alert(e?.message || String(e))
+    } finally { setLocalBusy(false) }
+  }
+
+  async function reopenLocalFolder() {
+    // Look for any previously-remembered folder
+    if (!isFileSystemAccessSupported()) return
+    // We don't know the label up-front; try the most recent saved one by listing keys
+    try {
+      const { listFolderLabels } = await import('@/lib/localStore')
+      const labels = await listFolderLabels()
+      if (!labels.length) { pickLocalFolder(); return }
+      const label = labels[0]
+      const handle = await recallDirHandle(label)
+      if (!handle) { pickLocalFolder(); return }
+      const ok = await ensurePermission(handle, 'readwrite')
+      if (!ok) { pickLocalFolder(); return }
+      setLocalLabel(label)
+      setLocalFiles(await listWebmsInFolder(handle))
+    } catch { pickLocalFolder() }
   }
 
   function copyLink(fileId: string) {
@@ -204,6 +263,49 @@ export default function Dashboard() {
             </div>
           </div>
         )}
+
+        {/* Local folder source (Phase 6) */}
+        <div className="bg-white border border-gray-100 rounded-2xl p-5 flex flex-col gap-3">
+          <div className="flex items-start gap-3">
+            <span className="text-2xl flex-shrink-0">🔒</span>
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-gray-900">Local folder (private)</p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Pick a folder on your computer to edit recordings without uploading them anywhere.
+                Whisper runs in your browser; your videos never leave your machine.
+              </p>
+            </div>
+            <div className="flex gap-2 flex-shrink-0">
+              <button onClick={reopenLocalFolder} disabled={localBusy}
+                className="text-xs font-medium text-gray-600 hover:text-brand-600 border border-gray-200 hover:border-brand-200 px-3 py-1.5 rounded-lg disabled:opacity-50">
+                ▶ Reopen
+              </button>
+              <button onClick={pickLocalFolder} disabled={localBusy}
+                className="text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-3 py-1.5 rounded-lg disabled:opacity-50">
+                {localBusy ? '…' : '📁 Pick folder'}
+              </button>
+            </div>
+          </div>
+          {localFiles.length > 0 && (
+            <div className="border-t border-gray-100 pt-3 flex flex-col gap-2">
+              <p className="text-[11px] uppercase tracking-wide text-gray-400">
+                {localFiles.length} .webm file{localFiles.length === 1 ? '' : 's'} in <code>{localLabel}</code>
+              </p>
+              {localFiles.map(f => (
+                <div key={f.name} className="flex items-center gap-3 text-sm">
+                  <span className="flex-1 truncate text-gray-700">{f.name}</span>
+                  <span className="text-xs text-gray-400 tabular-nums">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
+                  <a
+                    href={`/edit?source=local&name=${encodeURIComponent(f.name)}&folder=${encodeURIComponent(localLabel)}`}
+                    target="_blank" rel="noopener noreferrer"
+                    className="text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-3 py-1 rounded-lg">
+                    🪄 Step Guide
+                  </a>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* Recordings */}
         {recordings.length === 0 ? (
